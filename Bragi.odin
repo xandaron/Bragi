@@ -100,9 +100,11 @@ main :: proc() {
 			panic(fmt.aprintf("Failed to create dir: {}", data.outputPath))
 		}
 	}
-	filepath.walk("./images/misc/glasses.jpg", walkFunc, &data)
+	filepath.walk("./images/", walkFunc, &data)
 
+	fmt.printfln("Total compute time: {}", totalComputeTime)
 	fmt.printfln("Average compute time: {}", totalComputeTime / imageCount)
+	fmt.printfln("Total write time: {}", totalWriteTime)
 	fmt.printfln("Average write time: {}", totalWriteTime / imageCount)
 }
 
