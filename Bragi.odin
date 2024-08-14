@@ -7,6 +7,8 @@ import "core:mem"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
+import "core:time"
+import "core:math"
 
 import "vendor:glfw"
 import img "vendor:stb/image"
@@ -37,6 +39,9 @@ descriptorSet: vk.DescriptorSet
 pipelineLayout: vk.PipelineLayout
 pipeline: vk.Pipeline
 debugMessenger: vk.DebugUtilsMessengerEXT
+
+totalComputeTime, totalWriteTime: f64
+imageCount: f64
 
 // ###################################################################
 // #                       Data Structures                           #
@@ -79,9 +84,9 @@ main :: proc() {
 	defer cleanupStorageImages()
 
 	// TODO: add arg to pass a specific shader
-	// TODO: add arg to pass an image(s)
+	// TODO: add arg to pass images
 	// TODO: when no args are passed should compile all shaders and use on all images
-	// TODO: writing to disk seems to be a bottle neck. Might be worth looking into performance increases
+	// TODO: writing to disk seems to be a bottle neck. Might be worth looking into performance increases NOTE: I use an external HDD
 	data: Data = {
 		outputPath = "./output/compute",
 		shaderPath = "./shaders/compute.spv",
@@ -89,24 +94,21 @@ main :: proc() {
 
 	createPipeline(data.shaderPath)
 	defer cleanupPipeline()
-	
+
 	if !os.exists(data.outputPath) {
 		if os.make_directory(data.outputPath) != nil {
 			panic(fmt.aprintf("Failed to create dir: {}", data.outputPath))
 		}
 	}
-	filepath.walk("./images", walkFunc, &data)
+	filepath.walk("./images/misc/glasses.jpg", walkFunc, &data)
+
+	fmt.printfln("Average compute time: {}", totalComputeTime / imageCount)
+	fmt.printfln("Average write time: {}", totalWriteTime / imageCount)
 }
 
 processImage :: proc(imagePath, outputPath, shaderPath: string) {
 	width, height: i32
-	pixels := img.load(
-		strings.clone_to_cstring(imagePath),
-		&width,
-		&height,
-		nil,
-		4,
-	)
+	pixels := img.load(strings.clone_to_cstring(imagePath), &width, &height, nil, 4)
 	size := int(width * height * 4)
 
 	stagingBuffer: vk.Buffer
@@ -157,16 +159,7 @@ processImage :: proc(imagePath, outputPath, shaderPath: string) {
 		1,
 	)
 
-	vk.CmdBindDescriptorSets(
-		commandBuffer,
-		.COMPUTE,
-		pipelineLayout,
-		0,
-		1,
-		&descriptorSet,
-		0,
-		nil,
-	)
+	vk.CmdBindDescriptorSets(commandBuffer, .COMPUTE, pipelineLayout, 0, 1, &descriptorSet, 0, nil)
 
 	vk.CmdBindPipeline(commandBuffer, .COMPUTE, pipeline)
 
@@ -180,7 +173,7 @@ processImage :: proc(imagePath, outputPath, shaderPath: string) {
 		.TRANSFER_SRC_OPTIMAL,
 		1,
 	)
-	
+
 	copyImageToBuffer(commandBuffer, stagingBuffer, outImage.image, u32(width), u32(height))
 
 	if vk.EndCommandBuffer(commandBuffer) != .SUCCESS {
@@ -199,25 +192,47 @@ processImage :: proc(imagePath, outputPath, shaderPath: string) {
 		pSignalSemaphores    = nil,
 	}
 
+	start := time.now()
 	if vk.QueueSubmit(computeQueue, 1, &submitInfo, 0) != .SUCCESS {
 		panic("Failed to submit compute command buffer!")
 	}
-
 	vk.QueueWaitIdle(computeQueue)
+	elapsed := time.since(start)
+	secs := time.duration_seconds(elapsed)
+	fmt.printfln("Process time: {}s", time.duration_seconds(elapsed))
+	totalComputeTime += secs
 
 	vk.MapMemory(device, stagingBufferMemory, 0, vk.DeviceSize(size), {}, &data)
+
+	start = time.now()
 	img.write_jpg(strings.clone_to_cstring(outputPath), width, height, 4, data, 100)
-	
+	elapsed = time.since(start)
+	secs = time.duration_seconds(elapsed)
+	fmt.printfln("Write time: {}s", time.duration_seconds(elapsed))
+	totalWriteTime += secs
+
 	vk.UnmapMemory(device, stagingBufferMemory)
 	vk.DestroyBuffer(device, stagingBuffer, nil)
 	vk.FreeMemory(device, stagingBufferMemory, nil)
+	imageCount += 1
 }
 
-walkFunc: filepath.Walk_Proc : proc(info: os.File_Info, in_err: os.Error, user_data: rawptr) -> (err: os.Error, skip_dir: bool) {
+walkFunc: filepath.Walk_Proc : proc(
+	info: os.File_Info,
+	in_err: os.Error,
+	user_data: rawptr,
+) -> (
+	err: os.Error,
+	skip_dir: bool,
+) {
 	if info.is_dir {
 		return
 	}
-	processImage(info.fullpath, fmt.aprintf("{}/{}", (^Data)(user_data)^.outputPath, info.name), (^Data)(user_data)^.shaderPath)
+	processImage(
+		info.fullpath,
+		fmt.aprintf("{}/{}", (^Data)(user_data)^.outputPath, info.name),
+		(^Data)(user_data)^.shaderPath,
+	)
 	return
 }
 
