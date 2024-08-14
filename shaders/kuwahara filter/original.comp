@@ -24,7 +24,7 @@ vec4 sampleQuad(ivec2 uv, int x0, int x1, int y0, int y1, int n) {
     return vec4(colourSum / n, std);
 }
 
-int quadSize = 4;
+int quadSize = 8;
 int quadArea = quadSize * quadSize;
 
 void main() {
