@@ -15,12 +15,18 @@
         {
             "label": "compile_shaders",
             "type": "shell",
-            "command": "./shaders/com.bat"
+            "command": "./shaders/compile.bat"
+        },
+        {
+            "label": "debug_build",
+            "type": "shell",
+            "command": "odin build . -debug -out:build/bragi-debug.exe",
+            "group": "build"
         },
         {
             "label": "build",
             "type": "shell",
-            "command": "odin build . -debug -out:build/debug.exe",
+            "command": "odin build . -out:build/bragi.exe",
             "group": "build"
         },
         {
@@ -28,6 +34,7 @@
             "dependsOn": [
                 "mkdir",
                 "compile_shaders",
+                "debug_build",
                 "build"
             ]
         }

@@ -1,1 +1,0 @@
-glslc.exe %~dp0compute.comp -o %~dp0compute.spv

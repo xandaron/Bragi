@@ -1,0 +1,1 @@
+for /r %~dp0 %%f in (*.comp) do glslc.exe -c %%f -o %%~df%%~pf%%~nf.spv
