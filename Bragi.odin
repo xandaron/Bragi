@@ -3,6 +3,7 @@ package Bragi
 import "base:runtime"
 
 import "core:fmt"
+import "core:log"
 import "core:math"
 import "core:mem"
 import "core:os"
@@ -36,6 +37,8 @@ debugMessenger: vk.DebugUtilsMessengerEXT
 
 totalComputeTime, totalWriteTime, imageCount: f64
 
+logger: runtime.Logger
+
 Image :: struct {
 	image:         vk.Image,
 	memory:        vk.DeviceMemory,
@@ -60,6 +63,39 @@ Data :: struct {
 
 // TODO: writing to disk seems to be a bottle neck. Might be worth looking into performance increases NOTE: I use an external HDD
 main :: proc() {
+	loggerLevel: log.Level
+	when ODIN_DEBUG {
+		tracker: mem.Tracking_Allocator
+		mem.tracking_allocator_init(&tracker, context.allocator)
+		context.allocator = mem.tracking_allocator(&tracker)
+
+		defer {
+			if len(tracker.allocation_map) > 0 {
+				log.logf(
+					.Warning,
+					"=== %v allocations not freed: ===",
+					len(tracker.allocation_map),
+				)
+				for _, entry in tracker.allocation_map {
+					log.logf(.Warning, "- %v bytes @ %v", entry.size, entry.location)
+				}
+			}
+			if len(tracker.bad_free_array) > 0 {
+				log.logf(.Warning, "=== %v incorrect frees: ===", len(tracker.bad_free_array))
+				for entry in tracker.bad_free_array {
+					log.logf(.Warning, "- %p @ %v", entry.memory, entry.location)
+				}
+			}
+			mem.tracking_allocator_destroy(&tracker)
+		}
+		loggerLevel = .Debug
+	} else {
+		loggerLevel = .Error
+	}
+	logger = log.create_console_logger(loggerLevel)
+	context.logger = logger
+	defer log.destroy_console_logger(context.logger)
+
 	data: Data = {
 		inputPathRoot  = "./images/",
 		outputPathRoot = "./output/",
@@ -88,18 +124,18 @@ main :: proc() {
 				expectPath = true
 				pathExpected = 4
 			case:
-				fmt.printfln("Unexpected argument: {}", arg)
-				os.exit(-1)
+				log.logf(.Error, "Unexpected argument: {}", arg)
+				return
 			}
 			if acceptedFlags & pathExpected != 0 {
-				fmt.printfln("Duplicate flag: {}", arg)
-				os.exit(-1)
+				log.logf(.Error, "Duplicate flag: {}", arg)
+				return
 			}
 			continue
 		}
 		if !os.is_dir(arg) && !os.is_file(arg) {
-			fmt.printfln("Expected file path, got: {}", arg)
-			os.exit(-1)
+			log.logf(.Error, "Expected file path, got: {}", arg)
+			return
 		}
 		switch pathExpected {
 		case 1:
@@ -110,46 +146,63 @@ main :: proc() {
 		case 4:
 			data.shaderPathRoot = arg
 		case:
-			panic(fmt.aprintf("Unexpected value: pathExpected = {}", pathExpected))
+			panic(fmt.tprintf("Unexpected value: pathExpected = {}", pathExpected))
 		}
 		expectPath = false
 	}
 
 	if !os.exists(data.inputPathRoot) {
-		fmt.printfln("Image dir \"{}\" does not exist.", data.inputPathRoot)
-		os.exit(-1)
+		log.logf(.Error, "Image dir \"{}\" does not exist.", data.inputPathRoot)
+		return
 	}
 	if !os.exists(data.shaderPathRoot) {
-		fmt.printfln("Shader dir \"{}\" does not exist.", data.shaderPathRoot)
-		os.exit(-1)
+		log.logf(.Error, "Shader dir \"{}\" does not exist.", data.shaderPathRoot)
+		return
 	}
 	if !os.is_dir(data.outputPathRoot) {
-		fmt.printf("Output must be a dir: {}", data.outputPathRoot)
-		os.exit(-1)
+		log.logf(.Error, "Output must be a dir: {}", data.outputPathRoot)
+		return
 	}
-	if !os.exists(data.outputPathRoot) && os.make_directory(data.outputPathRoot) != nil{
-		fmt.printf("Failed to create dir: {}", data.outputPathRoot)
-		os.exit(-1)
+	if !os.exists(data.outputPathRoot) && os.make_directory(data.outputPathRoot) != nil {
+		log.logf(.Error, "Failed to create dir: {}", data.outputPathRoot)
+		return
 	}
 
 	if !glfw.Init() {
-		fmt.println("Failed to initalize glfw.")
-		os.exit(-1)
+		log.log(.Fatal, "Failed to initalize glfw.")
+		return
 	}
+	defer glfw.Terminate()
 
 	vk.load_proc_addresses(rawptr(glfw.GetInstanceProcAddress))
 
-	if createInstance() ||
-	   pickPhysicalDevice() ||
-	   createLogicalDevice() ||
-	   createCommandBuffer() ||
-	   createStorageImages() {
-		cleanup()
-		os.exit(-1)
+	if createInstance() {
+		return
 	}
+	defer vk.DestroyInstance(instance, nil)
+
+	if pickPhysicalDevice() {
+		return
+	}
+
+	if createLogicalDevice() {
+		return
+	}
+	defer vk.DestroyDevice(device, nil)
+
+	if createCommandBuffer() {
+		return
+	}
+	defer vk.DestroyCommandPool(device, commandPool, nil)
+
+	if createStorageImages() {
+		return
+	}
+	defer cleanupStorageImages()
 
 	when ODIN_DEBUG {
 		vkSetupDebugMessenger()
+		defer vk.DestroyDebugUtilsMessengerEXT(instance, debugMessenger, nil)
 	}
 
 	if os.is_file(data.shaderPathRoot) {
@@ -157,23 +210,20 @@ main :: proc() {
 		fileExtension := data.shaderPathRoot[nameLength - 4:nameLength]
 
 		if fileExtension != ".spv" {
-			fmt.printfln("Shader extension not recognised: \"{}\"", data.shaderPathRoot)
-		}
-		else {
+			log.logf(.Error, "Shader extension not recognised: \"{}\"", data.shaderPathRoot)
+		} else {
 			processShader(data.shaderPathRoot, &data)
 		}
-	}
-	else {
+	} else {
 		filepath.walk(data.shaderPathRoot, walkShaders, &data)
 	}
 
-	fmt.printfln("Total compute time: {}", totalComputeTime)
-	fmt.printfln("Average compute time: {}", totalComputeTime / imageCount)
-	fmt.printfln("Total write time: {}", totalWriteTime)
-	fmt.printfln("Average write time: {}", totalWriteTime / imageCount)
+	log.logf(.Info, "Total compute time: {}", totalComputeTime)
+	log.logf(.Info, "Average compute time: {}", totalComputeTime / imageCount)
+	log.logf(.Info, "Total write time: {}", totalWriteTime)
+	log.logf(.Info, "Average write time: {}", totalWriteTime / imageCount)
 
-	cleanupStorageImages()
-	cleanup()
+	vk.DeviceWaitIdle(device)
 }
 
 processShader :: proc(shaderPath: string, data: ^Data) {
@@ -188,10 +238,9 @@ processShader :: proc(shaderPath: string, data: ^Data) {
 			return
 		}
 		info, err := os.lstat(data^.inputPathRoot, context.temp_allocator)
-		processImage(data^.inputPathRoot, fmt.aprintf("{}/{}", data^.outputPath, info.name))
+		processImage(data^.inputPathRoot, fmt.tprintf("{}/{}", data^.outputPath, info.name))
 		os.file_info_delete(info, context.temp_allocator)
-	}
-	else {
+	} else {
 		filepath.walk(data^.inputPathRoot, walkImages, data)
 	}
 
@@ -218,19 +267,26 @@ walkShaders: filepath.Walk_Proc : proc(
 		return
 	}
 
-	user_data^.outputPath = fmt.aprintf("{}/{}", user_data^.outputPathRoot, info.name[:nameLength - 4])
+	user_data^.outputPath = fmt.tprintf(
+		"{}/{}",
+		user_data^.outputPathRoot,
+		info.name[:nameLength - 4],
+	)
 
 	if !os.exists(user_data^.outputPath) && os.make_directory(user_data^.outputPath) != nil {
-		fmt.printf("Failed to create dir: {}", user_data^.outputPath)
+		log.logf(.Error, "Failed to create dir: {}", user_data^.outputPath)
 	}
 
 	processShader(info.fullpath, (^Data)(user_data))
+	free_all(context.temp_allocator)
 	return
 }
 
 processImage :: proc(imagePath, outputPath: string) -> b8 {
 	width, height: i32
-	pixels := img.load(strings.clone_to_cstring(imagePath), &width, &height, nil, 4)
+	inPath := strings.clone_to_cstring(imagePath)
+	pixels := img.load(inPath, &width, &height, nil, 4)
+	delete(inPath)
 	size := int(width * height * 4)
 
 	stagingBuffer: vk.Buffer
@@ -261,7 +317,7 @@ processImage :: proc(imagePath, outputPath: string) -> b8 {
 	}
 
 	if vk.BeginCommandBuffer(commandBuffer, &beginInfo) != .SUCCESS {
-		fmt.println("Failed to start recording command buffer!")
+		log.log(.Error, "Failed to start recording command buffer!")
 		vk.DestroyBuffer(device, stagingBuffer, nil)
 		vk.FreeMemory(device, stagingBufferMemory, nil)
 		return true
@@ -281,7 +337,7 @@ processImage :: proc(imagePath, outputPath: string) -> b8 {
 	copyImageToBuffer(commandBuffer, stagingBuffer, outImage.image, u32(width), u32(height))
 
 	if vk.EndCommandBuffer(commandBuffer) != .SUCCESS {
-		fmt.println("Failed to end recording to command buffer!")
+		log.log(.Error, "Failed to end recording to command buffer!")
 		vk.DestroyBuffer(device, stagingBuffer, nil)
 		vk.FreeMemory(device, stagingBufferMemory, nil)
 		return true
@@ -300,7 +356,7 @@ processImage :: proc(imagePath, outputPath: string) -> b8 {
 	}
 
 	if vk.QueueSubmit(computeQueue, 1, &submitInfo, 0) != .SUCCESS {
-		fmt.println("Failed to submit to queue!")
+		log.log(.Error, "Failed to submit to queue!")
 		vk.DestroyBuffer(device, stagingBuffer, nil)
 		vk.FreeMemory(device, stagingBufferMemory, nil)
 		return true
@@ -310,16 +366,18 @@ processImage :: proc(imagePath, outputPath: string) -> b8 {
 	vk.DeviceWaitIdle(device)
 	elapsed := time.since(start)
 	secs := time.duration_seconds(elapsed)
-	fmt.printfln("Process time: {}s", time.duration_seconds(elapsed))
+	log.logf(.Info, "Process time: {}s", time.duration_seconds(elapsed))
 	totalComputeTime += secs
 
 	vk.MapMemory(device, stagingBufferMemory, 0, vk.DeviceSize(size), {}, &data)
 
 	start = time.now()
-	img.write_jpg(strings.clone_to_cstring(outputPath), width, height, 4, data, 100)
+	outPath := strings.clone_to_cstring(outputPath)
+	img.write_jpg(outPath, width, height, 4, data, 100)
+	delete(outPath)
 	elapsed = time.since(start)
 	secs = time.duration_seconds(elapsed)
-	fmt.printfln("Write time: {}s", time.duration_seconds(elapsed))
+	log.logf(.Info, "Write time: {}s", time.duration_seconds(elapsed))
 	totalWriteTime += secs
 
 	vk.UnmapMemory(device, stagingBufferMemory)
@@ -350,32 +408,13 @@ walkImages: filepath.Walk_Proc : proc(
 
 	if processImage(
 		info.fullpath,
-		fmt.aprintf("{}/{}", (^Data)(user_data)^.outputPath, info.name),
+		fmt.tprintf("{}/{}", (^Data)(user_data)^.outputPath, info.name),
 	) {
-		fmt.printfln("Failed to process image: \"{}\"", info.fullpath)
+		log.logf(.Error, "Failed to process image: \"{}\"", info.fullpath)
 	}
-	return
-}
 
-cleanup :: proc() {
-	if device != nil {
-		vk.DeviceWaitIdle(device)
-	}
-	if commandPool != 0 {
-		vk.DestroyCommandPool(device, commandPool, nil)
-	}
-	if device != nil {
-		vk.DestroyDevice(device, nil)
-	}
-	when ODIN_DEBUG {
-		if debugMessenger != 0 {
-			vk.DestroyDebugUtilsMessengerEXT(instance, debugMessenger, nil)
-		}
-	}
-	if instance != nil {
-		vk.DestroyInstance(instance, nil)
-	}
-	glfw.Terminate()
+	free_all(context.temp_allocator)
+	return
 }
 
 createInstance :: proc() -> b8 {
@@ -420,7 +459,7 @@ createInstance :: proc() -> b8 {
 	}
 
 	if vk.CreateInstance(&instanceInfo, nil, &instance) != .SUCCESS {
-		fmt.println("Failed to create vulkan instance!")
+		log.log(.Fatal, "Failed to create vulkan instance!")
 		return true
 	}
 
@@ -469,11 +508,12 @@ pickPhysicalDevice :: proc() -> b8 {
 	vk.EnumeratePhysicalDevices(instance, &deviceCount, nil)
 
 	if deviceCount == 0 {
-		fmt.println("No available devices!")
+		log.log(.Fatal, "No available devices!")
 		return true
 	}
 
 	physicalDevices := make([]vk.PhysicalDevice, deviceCount)
+	defer delete(physicalDevices)
 	vk.EnumeratePhysicalDevices(instance, &deviceCount, raw_data(physicalDevices))
 
 	physicalDeviceMap: map[^vk.PhysicalDevice]u32
@@ -491,7 +531,7 @@ pickPhysicalDevice :: proc() -> b8 {
 	}
 
 	if physicalDevice == nil {
-		fmt.println("No suitable device found!")
+		log.log(.Fatal, "No suitable device found!")
 		return true
 	}
 
@@ -586,7 +626,7 @@ createLogicalDevice :: proc() -> b8 {
 	}
 
 	if vk.CreateDevice(physicalDevice, &createInfo, nil, &device) != .SUCCESS {
-		fmt.println("Failed to create device!")
+		log.log(.Fatal, "Failed to create device!")
 		return true
 	}
 
@@ -603,7 +643,7 @@ createCommandBuffer :: proc() -> b8 {
 		queueFamilyIndex = computeFamily,
 	}
 	if vk.CreateCommandPool(device, &poolInfo, nil, &commandPool) != .SUCCESS {
-		fmt.println("Failed to create command pool!")
+		log.log(.Fatal, "Failed to create command pool!")
 		return true
 	}
 
@@ -616,7 +656,7 @@ createCommandBuffer :: proc() -> b8 {
 	}
 
 	if vk.AllocateCommandBuffers(device, &allocInfo, &commandBuffer) != .SUCCESS {
-		fmt.println("Failed to allocate command buffer!")
+		log.log(.Fatal, "Failed to allocate command buffer!")
 		vk.DestroyCommandPool(device, commandPool, nil)
 		return true
 	}
@@ -697,12 +737,12 @@ createPipeline :: proc(shaderPath: string) -> b8 {
 		loadShaderFile :: proc(filepath: string) -> (data: []byte, success: bool) {
 			fileHandle, err := os.open(filepath, mode = (os.O_RDONLY | os.O_APPEND))
 			if err != 0 {
-				fmt.println("Shader file couldn't be opened!")
+				log.log(.Fatal, "Shader file couldn't be opened!")
 				return nil, false
 			}
 			data, success = os.read_entire_file_from_handle(fileHandle)
 			if !success {
-				fmt.println("Shader file couldn't be read!")
+				log.log(.Fatal, "Shader file couldn't be read!")
 			}
 			os.close(fileHandle)
 			return
@@ -712,6 +752,7 @@ createPipeline :: proc(shaderPath: string) -> b8 {
 		if !success {
 			return 0, true
 		}
+		defer delete(code)
 
 		createInfo: vk.ShaderModuleCreateInfo = {
 			sType    = .SHADER_MODULE_CREATE_INFO,
@@ -721,7 +762,7 @@ createPipeline :: proc(shaderPath: string) -> b8 {
 			pCode    = (^u32)(raw_data(code)),
 		}
 		if vk.CreateShaderModule(device, &createInfo, nil, &shaderModule) != .SUCCESS {
-			fmt.println("Failed to create shader module!")
+			log.log(.Fatal, "Failed to create shader module!")
 			return 0, true
 		}
 		return shaderModule, false
@@ -738,7 +779,7 @@ createPipeline :: proc(shaderPath: string) -> b8 {
 	}
 
 	if vk.CreateDescriptorPool(device, &poolInfo, nil, &descriptorPool) != .SUCCESS {
-		fmt.println("Failed to create descriptor pool!")
+		log.log(.Fatal, "Failed to create descriptor pool!")
 		return true
 	}
 
@@ -768,7 +809,7 @@ createPipeline :: proc(shaderPath: string) -> b8 {
 	}
 
 	if vk.CreateDescriptorSetLayout(device, &layoutInfo, nil, &descriptorSetLayout) != .SUCCESS {
-		fmt.println("Failed to create descriptor set layout!")
+		log.log(.Fatal, "Failed to create descriptor set layout!")
 		vk.DestroyDescriptorPool(device, descriptorPool, nil)
 		return true
 	}
@@ -784,7 +825,7 @@ createPipeline :: proc(shaderPath: string) -> b8 {
 	}
 
 	if vk.AllocateDescriptorSets(device, &allocInfo, &descriptorSet) != .SUCCESS {
-		fmt.println("Failed to allocate descriptor sets!")
+		log.log(.Fatal, "Failed to allocate descriptor sets!")
 		vk.DestroyDescriptorSetLayout(device, descriptorSetLayout, nil)
 		vk.DestroyDescriptorPool(device, descriptorPool, nil)
 		return true
@@ -841,7 +882,7 @@ createPipeline :: proc(shaderPath: string) -> b8 {
 	}
 
 	if vk.CreatePipelineLayout(device, &PipelineLayoutInfo, nil, &pipelineLayout) != .SUCCESS {
-		fmt.println("Failed to create pipeline layout!")
+		log.log(.Fatal, "Failed to create pipeline layout!")
 		vk.DestroyDescriptorSetLayout(device, descriptorSetLayout, nil)
 		vk.DestroyDescriptorPool(device, descriptorPool, nil)
 		return true
@@ -875,7 +916,7 @@ createPipeline :: proc(shaderPath: string) -> b8 {
 	}
 
 	if vk.CreateComputePipelines(device, 0, 1, &pipelineInfo, nil, &pipeline) != .SUCCESS {
-		fmt.println("Failed to create pipeline!")
+		log.log(.Fatal, "Failed to create pipeline!")
 		vk.DestroyPipelineLayout(device, pipelineLayout, nil)
 		vk.DestroyDescriptorSetLayout(device, descriptorSetLayout, nil)
 		vk.DestroyDescriptorPool(device, descriptorPool, nil)
@@ -902,7 +943,7 @@ findMemoryType :: proc(typeFilter: u32, properties: vk.MemoryPropertyFlags) -> u
 			return i
 		}
 	}
-	fmt.println("Failed to find suitable memory type!")
+	log.log(.Fatal, "Failed to find suitable memory type!")
 	return ~u32(0)
 }
 
@@ -924,7 +965,7 @@ createBuffer :: proc(
 		pQueueFamilyIndices   = nil,
 	}
 	if vk.CreateBuffer(device, &bufferInfo, nil, buffer) != .SUCCESS {
-		fmt.println("Failed to create buffer!")
+		log.log(.Fatal, "Failed to create buffer!")
 		return true
 	}
 
@@ -932,7 +973,7 @@ createBuffer :: proc(
 	vk.GetBufferMemoryRequirements(device, buffer^, &memRequirements)
 	memType := findMemoryType(memRequirements.memoryTypeBits, properties)
 	if ~memType == 0 {
-		fmt.println("Failed to find suitable memory type!")
+		log.log(.Fatal, "Failed to find suitable memory type!")
 		vk.DestroyBuffer(device, buffer^, nil)
 		return true
 	}
@@ -943,7 +984,7 @@ createBuffer :: proc(
 		memoryTypeIndex = memType,
 	}
 	if vk.AllocateMemory(device, &allocInfo, nil, bufferMemory) != .SUCCESS {
-		fmt.println("Failed to allocate buffer memory!")
+		log.log(.Fatal, "Failed to allocate buffer memory!")
 		vk.DestroyBuffer(device, buffer^, nil)
 		return true
 	}
@@ -983,7 +1024,7 @@ createImage :: proc(
 	}
 
 	if vk.CreateImage(device, &imageInfo, nil, &image^.image) != .SUCCESS {
-		fmt.println("Faile to create image!")
+		log.log(.Fatal, "Faile to create image!")
 		return true
 	}
 
@@ -991,7 +1032,7 @@ createImage :: proc(
 	vk.GetImageMemoryRequirements(device, image.image, &memRequirements)
 	memType := findMemoryType(memRequirements.memoryTypeBits, properties)
 	if ~memType == 0 {
-		fmt.println("Failed to find suitable memory type!")
+		log.log(.Fatal, "Failed to find suitable memory type!")
 		vk.DestroyImage(device, image^.image, nil)
 		return true
 	}
@@ -1003,13 +1044,13 @@ createImage :: proc(
 	}
 
 	if vk.AllocateMemory(device, &allocInfo, nil, &image^.memory) != .SUCCESS {
-		fmt.println("Failed to allocate image memory!")
+		log.log(.Fatal, "Failed to allocate image memory!")
 		vk.DestroyImage(device, image^.image, nil)
 		return true
 	}
 
 	if vk.BindImageMemory(device, image^.image, image^.memory, 0) != .SUCCESS {
-		fmt.println("Failed to bind image memory!")
+		log.log(.Fatal, "Failed to bind image memory!")
 		vk.DestroyImage(device, image^.image, nil)
 		vk.FreeMemory(device, image^.memory, nil)
 		return true
@@ -1041,7 +1082,7 @@ createImageView :: proc(
 	}
 
 	if vk.CreateImageView(device, &viewInfo, nil, &image^.view) != .SUCCESS {
-		fmt.println("Failed to create image view!")
+		log.log(.Fatal, "Failed to create image view!")
 		return true
 	}
 	return false
@@ -1195,7 +1236,8 @@ when ODIN_DEBUG {
 			pUserData: rawptr,
 		) -> b32 {
 			context = runtime.default_context()
-			severity: cstring
+			context.logger = logger
+			severity: string
 			if .GENERAL in messageType {
 				severity = "General"
 			} else if .VALIDATION in messageType {
@@ -1205,7 +1247,12 @@ when ODIN_DEBUG {
 			} else {
 				severity = "Unknown"
 			}
-			fmt.printfln("Vulkan validation layer ({}):\n{}\n", severity, pCallbackData.pMessage)
+			log.logf(
+				.Debug,
+				"Vulkan validation layer ({}):\n{}\n",
+				severity,
+				pCallbackData.pMessage,
+			)
 			return false
 		}
 	} else {
@@ -1216,7 +1263,8 @@ when ODIN_DEBUG {
 			pUserData: rawptr,
 		) -> b32 {
 			context = runtime.default_context()
-			severity: cstring
+			context.logger = logger
+			severity: string
 			if .GENERAL in messageType {
 				severity = "General"
 			} else if .VALIDATION in messageType {
@@ -1226,7 +1274,12 @@ when ODIN_DEBUG {
 			} else {
 				severity = "Unknown"
 			}
-			fmt.printfln("Vulkan validation layer ({}):\n{}\n", severity, pCallbackData.pMessage)
+			log.logf(
+				.Debug,
+				"Vulkan validation layer ({}):\n{}\n",
+				severity,
+				pCallbackData.pMessage,
+			)
 			return false
 		}
 	}
