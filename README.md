@@ -4,7 +4,7 @@ Bragi is an image processor build in Odin using Vulkan.
 ## Using Bragi
 Bragi is designed to be used as a command line tool used as shown bellow:
 ```Shell
-/path/to/bragi.exe -i ./images/ -o ./output_images/ -s ./shaders/
+/path/to/bragi.exe -i ./images/ -o ./output/ -s ./shaders/
     -i, -I: "Path to images to apply shader to."
     -o, -O: "Path to desired output folder. Bragi will create the folder if it doesn't already exit."
     -s, -S: "Path to compute shaders."
